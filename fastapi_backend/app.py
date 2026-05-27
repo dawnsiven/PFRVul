@@ -11,12 +11,19 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from fastapi_backend.code_chunking import run_code_chunking
-from fastapi_backend.code_inference import run_single_inference
+from fastapi_backend.chunk_review_schemas import (
+    FrontendChunkReviewRequest,
+    FrontendChunkReviewResponse,
+)
+from fastapi_backend.code_chunking import run_code_chunking, save_chunking_payload
+from fastapi_backend.code_inference import run_file_inference, run_single_inference
+from fastapi_backend.frontend_chunk_review import run_frontend_chunk_review
 from fastapi_backend.job_runner import JobManager, REPO_ROOT
 from fastapi_backend.schemas import (
     AblationJobRequest,
     ClassicalJobRequest,
+    FrontendCodeChunkExample,
+    FrontendCodeChunkFlat,
     FrontendCodeChunkItem,
     FrontendCodeChunkRequest,
     FrontendCodeChunkResponse,
@@ -24,8 +31,13 @@ from fastapi_backend.schemas import (
     DataUploadResponse,
     FrontendCodeInferenceRequest,
     FrontendCodeInferenceResponse,
+    FrontendCodeInferenceFileRequest,
+    FrontendCodeInferenceFileResponse,
     FrontendDataIngestResponse,
+    FrontendFindCodeRequest,
+    FrontendFindCodeResponse,
     FileOption,
+    FrontendInputJsonOptionsResponse,
     ImbalanceClassicalJobRequest,
     ImbalanceLLMJobRequest,
     JobLogResponse,
@@ -123,6 +135,28 @@ def _resolve_data_path(relative_path: str = "") -> Path:
         candidate.relative_to(DATA_ROOT.resolve())
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid data path.") from exc
+    return candidate
+
+
+def _resolve_user_scoped_path(base_root: Path, relative_path: str, label: str) -> Path:
+    normalized_relative = relative_path.strip().lstrip("/")
+    if not normalized_relative:
+        return base_root
+
+    if str(base_root.name) == "data" and normalized_relative.startswith("data/"):
+        normalized_relative = normalized_relative[len("data/") :]
+    elif str(base_root.name) == "outputs" and normalized_relative.startswith("outputs/"):
+        normalized_relative = normalized_relative[len("outputs/") :]
+
+    candidate = (base_root / normalized_relative).resolve()
+    try:
+        candidate.relative_to(base_root.resolve())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid {label} path.") from exc
+
+    relative_parts = candidate.relative_to(base_root.resolve()).parts
+    if relative_parts and not relative_parts[0].startswith("user_"):
+        raise HTTPException(status_code=400, detail=f"{label} path must stay inside a user_* folder.")
     return candidate
 
 
@@ -480,9 +514,99 @@ def _merge_file_options(*option_groups: list[FileOption]) -> list[FileOption]:
         for item in group:
             if item.path in seen_paths:
                 continue
-            seen_paths.add(item.path)
-            merged.append(item)
+                seen_paths.add(item.path)
+                merged.append(item)
     return merged
+
+
+def _scan_frontend_input_json_options() -> list[FileOption]:
+    if not DATA_ROOT.exists():
+        return []
+
+    options: list[FileOption] = []
+    for user_dir in sorted(DATA_ROOT.iterdir()):
+        if not user_dir.is_dir() or not user_dir.name.startswith("user_"):
+            continue
+        for path in sorted(user_dir.glob("*.json")):
+            options.append(
+                FileOption(
+                    label=path.name,
+                    path=_to_relative_repo_path(path),
+                )
+            )
+    return options
+
+
+def _list_user_root_directories(base_root: Path) -> OutputListResponse:
+    entries: list[OutputEntry] = []
+    if base_root.exists():
+        for item in sorted(base_root.iterdir(), key=lambda path: path.name.lower()):
+            if not item.is_dir() or not item.name.startswith("user_"):
+                continue
+            entries.append(
+                OutputEntry(
+                    name=item.name,
+                    relative_path=item.name,
+                    entry_type="directory",
+                    size=None,
+                )
+            )
+    return OutputListResponse(base_dir=str(base_root), relative_path="", entries=entries)
+
+
+def _find_code_from_chunking_request(
+    *,
+    relative_path: str,
+    sample_id: Optional[str],
+    filename: Optional[str],
+) -> FrontendFindCodeResponse:
+    target = _resolve_user_scoped_path(DATA_ROOT, relative_path, "data")
+    _assert_exists(target, "data file")
+    if not target.is_file():
+        raise HTTPException(status_code=400, detail="Target path is not a file.")
+    if target.name != "chunking_request.json":
+        raise HTTPException(status_code=400, detail="relative_path must point to chunking_request.json.")
+
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="chunking_request.json is not valid JSON.") from exc
+
+    items = payload.get("items")
+    if not isinstance(items, list):
+        raise HTTPException(status_code=400, detail="chunking_request.json does not contain a valid items array.")
+
+    normalized_sample_id = (sample_id or "").strip()
+    normalized_filename = (filename or "").strip()
+    if not normalized_sample_id and not normalized_filename:
+        raise HTTPException(status_code=400, detail="Provide sample_id or filename.")
+
+    match: Optional[dict] = None
+    if normalized_sample_id:
+        for item in items:
+            if isinstance(item, dict) and str(item.get("sample_id", "")).strip() == normalized_sample_id:
+                match = item
+                break
+    elif normalized_filename:
+        for item in items:
+            if isinstance(item, dict) and str(item.get("filename", "")).strip() == normalized_filename:
+                match = item
+                break
+
+    if match is None:
+        query_label = f"sample_id={normalized_sample_id}" if normalized_sample_id else f"filename={normalized_filename}"
+        raise HTTPException(status_code=404, detail=f"No matching item found for {query_label}.")
+
+    code = str(match.get("code") or "").strip()
+    if not code:
+        raise HTTPException(status_code=404, detail="Matched item does not contain code.")
+
+    return FrontendFindCodeResponse(
+        sample_id=None if match.get("sample_id") is None else str(match.get("sample_id")),
+        filename=None if match.get("filename") is None else str(match.get("filename")),
+        language=None if match.get("language") is None else str(match.get("language")),
+        code=code,
+    )
 
 
 def _list_directory(root_path: Path, target: Path) -> OutputListResponse:
@@ -814,6 +938,75 @@ def get_output_file(relative_path: str = Query(...)) -> FileResponse:
     return FileResponse(target, media_type=media_type or "application/octet-stream", filename=target.name)
 
 
+@app.get("/api/frontend/user-data", response_model=OutputListResponse)
+def list_frontend_user_data(relative_path: str = Query(default="")) -> OutputListResponse:
+    if not relative_path.strip():
+        return _list_user_root_directories(DATA_ROOT)
+
+    target = _resolve_user_scoped_path(DATA_ROOT, relative_path, "data")
+    _assert_exists(target, "data path")
+    if not target.is_dir():
+        raise HTTPException(status_code=400, detail="Target path is not a directory.")
+    return _list_directory(DATA_ROOT, target)
+
+
+@app.get("/api/frontend/user-data/text", response_model=OutputTextResponse)
+def read_frontend_user_data_text(
+    relative_path: str = Query(...),
+    max_chars: int = Query(default=200000, ge=1, le=1000000),
+) -> OutputTextResponse:
+    target = _resolve_user_scoped_path(DATA_ROOT, relative_path, "data")
+    _assert_exists(target, "data file")
+    if not target.is_file():
+        raise HTTPException(status_code=400, detail="Target path is not a file.")
+
+    content = _read_text_file(target, max_chars=max_chars)
+    return OutputTextResponse(
+        base_dir=str(DATA_ROOT),
+        relative_path=str(target.relative_to(DATA_ROOT.resolve())),
+        content=content,
+    )
+
+
+@app.post("/api/frontend/user-data/find-code", response_model=FrontendFindCodeResponse)
+def frontend_find_code(payload: FrontendFindCodeRequest) -> FrontendFindCodeResponse:
+    return _find_code_from_chunking_request(
+        relative_path=payload.relative_path,
+        sample_id=payload.sample_id,
+        filename=payload.filename,
+    )
+
+
+@app.get("/api/frontend/user-outputs", response_model=OutputListResponse)
+def list_frontend_user_outputs(relative_path: str = Query(default="")) -> OutputListResponse:
+    if not relative_path.strip():
+        return _list_user_root_directories(OUTPUTS_ROOT)
+
+    target = _resolve_user_scoped_path(OUTPUTS_ROOT, relative_path, "outputs")
+    _assert_exists(target, "outputs path")
+    if not target.is_dir():
+        raise HTTPException(status_code=400, detail="Target path is not a directory.")
+    return _list_directory(OUTPUTS_ROOT, target)
+
+
+@app.get("/api/frontend/user-outputs/text", response_model=OutputTextResponse)
+def read_frontend_user_outputs_text(
+    relative_path: str = Query(...),
+    max_chars: int = Query(default=200000, ge=1, le=1000000),
+) -> OutputTextResponse:
+    target = _resolve_user_scoped_path(OUTPUTS_ROOT, relative_path, "outputs")
+    _assert_exists(target, "output file")
+    if not target.is_file():
+        raise HTTPException(status_code=400, detail="Target path is not a file.")
+
+    content = _read_text_file(target, max_chars=max_chars)
+    return OutputTextResponse(
+        base_dir=str(OUTPUTS_ROOT),
+        relative_path=str(target.relative_to(OUTPUTS_ROOT.resolve())),
+        content=content,
+    )
+
+
 @app.get("/api/meta/options")
 def get_options() -> dict[str, object]:
     datasets = _scan_data_directories()
@@ -889,6 +1082,11 @@ def get_llm_test_options() -> LLMTestOptionsResponse:
     )
 
 
+@app.get("/api/meta/frontend-input-json-options", response_model=FrontendInputJsonOptionsResponse)
+def get_frontend_input_json_options() -> FrontendInputJsonOptionsResponse:
+    return FrontendInputJsonOptionsResponse(items=_scan_frontend_input_json_options())
+
+
 @app.get("/api/llm-test/files", response_model=OutputListResponse)
 def list_llm_test_files(
     root: str = Query(..., pattern="^(prompt|intermediate|output)$"),
@@ -945,6 +1143,11 @@ def create_llm_test_prompt(payload: PromptCreateRequest) -> PromptFileResponse:
     )
 
 
+@app.post("/api/frontend/prompt-files", response_model=PromptFileResponse)
+def create_frontend_prompt_file(payload: PromptCreateRequest) -> PromptFileResponse:
+    return create_llm_test_prompt(payload)
+
+
 @app.post("/api/jobs/classical", response_model=JobResponse)
 def create_classical_job(payload: ClassicalJobRequest) -> JobResponse:
     if payload.model_name not in GRAPH_MODELS:
@@ -988,6 +1191,30 @@ def frontend_code_inference(payload: FrontendCodeInferenceRequest) -> FrontendCo
     return FrontendCodeInferenceResponse(**result)
 
 
+@app.post("/api/frontend/code-inference-file", response_model=FrontendCodeInferenceFileResponse)
+def frontend_code_inference_file(payload: FrontendCodeInferenceFileRequest) -> FrontendCodeInferenceFileResponse:
+    checkpoint_dir = _resolve_checkpoint_dir(payload.checkpoint_dir)
+    input_json = _resolve_repo_path(payload.input_json, "input_json")
+    _assert_exists(input_json, "input_json")
+    try:
+        result = run_file_inference(
+            model_name=payload.model_name,
+            checkpoint_dir=checkpoint_dir,
+            input_json_path=input_json,
+            block_size=payload.block_size,
+            device_name=payload.device,
+            preview_limit=payload.preview_limit,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return FrontendCodeInferenceFileResponse(**result)
+
+
 @app.post("/api/frontend/code-chunking", response_model=FrontendCodeChunkResponse)
 def frontend_code_chunking(payload: FrontendCodeChunkRequest) -> FrontendCodeChunkResponse:
     items: list[FrontendCodeChunkItem] = []
@@ -1009,6 +1236,8 @@ def frontend_code_chunking(payload: FrontendCodeChunkRequest) -> FrontendCodeChu
         raise HTTPException(status_code=400, detail="Provide either code or items for chunking.")
 
     results: list[FrontendCodeChunkResult] = []
+    flat_chunks: list[FrontendCodeChunkFlat] = []
+    examples: list[FrontendCodeChunkExample] = []
     total_chunks = 0
 
     for item in items:
@@ -1036,11 +1265,96 @@ def frontend_code_chunking(payload: FrontendCodeChunkRequest) -> FrontendCodeChu
             )
         )
 
+        for chunk in chunking_result["chunks"]:
+            flat_chunks.append(
+                FrontendCodeChunkFlat(
+                    sample_id=item.sample_id,
+                    filename=item.filename,
+                    chunk_index=int(chunk["index"]),
+                    text=str(chunk["text"]),
+                    start_line=int(chunk["start_line"]),
+                    end_line=int(chunk["end_line"]),
+                    token_count=int(chunk["token_count"]),
+                )
+            )
+            if len(examples) >= 5:
+                break
+            examples.append(
+                FrontendCodeChunkExample(
+                    sample_id=item.sample_id,
+                    filename=item.filename,
+                    chunk_index=int(chunk["index"]),
+                    text=str(chunk["text"]),
+                    start_line=int(chunk["start_line"]),
+                    end_line=int(chunk["end_line"]),
+                    token_count=int(chunk["token_count"]),
+                )
+            )
+
+    response_payload = {
+        "folder_name": f"user_{payload.folder_name.strip()}",
+        "storage_dir": "",
+        "total_inputs": len(items),
+        "total_chunks": total_chunks,
+        "chunks": [item.model_dump() for item in flat_chunks],
+        "examples": [item.model_dump() for item in examples],
+        "results": [item.model_dump() for item in results],
+    }
+    request_payload = payload.model_dump()
+
+    try:
+        storage_dir = save_chunking_payload(
+            folder_name=payload.folder_name,
+            max_tokens=payload.max_tokens,
+            payload=response_payload,
+            request_payload=request_payload,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    response_payload["storage_dir"] = str(storage_dir)
+
     return FrontendCodeChunkResponse(
-        total_inputs=len(items),
-        total_chunks=total_chunks,
-        results=results,
+        **response_payload,
     )
+
+
+@app.post("/api/frontend/chunk-review", response_model=FrontendChunkReviewResponse)
+def frontend_chunk_review(payload: FrontendChunkReviewRequest) -> FrontendChunkReviewResponse:
+    prompt_file = None
+    if payload.prompt_file or payload.prompt_name or payload.prompt_content:
+        prompt_file = _resolve_or_create_prompt_file(
+            prompt_file=payload.prompt_file,
+            prompt_name=payload.prompt_name,
+            prompt_content=payload.prompt_content,
+            prompt_overwrite=payload.prompt_overwrite,
+        )
+
+    try:
+        result = run_frontend_chunk_review(
+            config_path=payload.config,
+            env_file=payload.env_file,
+            prompt_file=prompt_file,
+            code=payload.code,
+            chunks=[chunk.model_dump() for chunk in payload.chunks],
+            language=payload.language,
+            model=payload.model,
+            api_base=payload.api_base,
+            api_key=payload.api_key,
+            temperature=payload.temperature,
+            max_tokens=payload.max_tokens,
+            timeout=payload.timeout,
+            retries=payload.retries,
+            sleep_seconds=payload.sleep_seconds,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return FrontendChunkReviewResponse(**result)
 
 
 @app.post("/api/jobs/classical-imbalance", response_model=JobResponse)

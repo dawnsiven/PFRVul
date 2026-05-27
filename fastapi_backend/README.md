@@ -330,7 +330,172 @@ console.log(result.prediction, result.vulnerability_probability);
 - 如果 `checkpoint_dir/checkpoint-best-f1/model.bin` 不存在，请求会返回 `404`
 - 如果请求 `cuda` 但当前机器没有可用 GPU，请求会返回 `400`
 
-### 2.5 `POST /api/frontend/code-chunking`
+### 2.5 `POST /api/frontend/code-inference-file`
+
+用途：直接读取仓库内一个 JSON 文件中的代码样本或切分结果，批量调用小模型做检测。  
+这个接口适合你现在这种场景，例如直接检测：
+`data/user_demo_chunks/user_demo_chunks_0-512_test.json`
+
+接口行为：
+
+- 支持读取 `/api/frontend/code-chunking` 保存下来的结果文件
+- 也兼容读取简单的 JSON 数组，只要每项里有 `input`、`code` 或 `text`
+- 检测结果会保存到 `outputs/<输入文件所在目录名>/` 下
+- 同步返回汇总信息和前若干条预览结果
+
+请求体示例：
+
+```json
+{
+  "model_name": "CodeBERT",
+  "checkpoint_dir": "outputs/CodeBERT/cvefixes_cwe20_0-512",
+  "input_json": "data/user_demo_chunks/user_demo_chunks_0-512_test.json",
+  "block_size": 512,
+  "device": "auto",
+  "preview_limit": 20
+}
+```
+
+成功响应示例：
+
+```json
+{
+  "model_name": "CodeBERT",
+  "checkpoint_dir": "/home/zjr123/LLM4CVD-main/outputs/CodeBERT/cvefixes_cwe20_0-512",
+  "checkpoint_file": "/home/zjr123/LLM4CVD-main/outputs/CodeBERT/cvefixes_cwe20_0-512/checkpoint-best-f1/model.bin",
+  "device": "cpu",
+  "input_json": "/home/zjr123/LLM4CVD-main/data/user_demo_chunks/user_demo_chunks_0-512_test.json",
+  "result_json": "/home/zjr123/LLM4CVD-main/outputs/user_demo_chunks/user_demo_chunks_0-512_test_CodeBERT_frontend_inference.json",
+  "result_csv": "/home/zjr123/LLM4CVD-main/outputs/user_demo_chunks/user_demo_chunks_0-512_test_CodeBERT_frontend_inference.csv",
+  "total_samples": 128,
+  "vulnerable_samples": 17,
+  "preview": [
+    {
+      "index": 0,
+      "sample_id": "demo-1",
+      "filename": "main.c",
+      "chunk_index": 0,
+      "vulnerability_probability": 0.82,
+      "code": "char buf[8]; gets(buf);"
+    }
+  ]
+}
+```
+
+落盘文件说明：
+
+- `outputs/<输入文件所在目录名>/<input_stem>_<model_name>_frontend_inference.json`: 完整推理结果
+- `outputs/<输入文件所在目录名>/<input_stem>_<model_name>_frontend_inference.csv`: 便于和现有分析脚本衔接的表格结果
+
+调用示例：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/frontend/code-inference-file \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_name": "CodeBERT",
+    "checkpoint_dir": "outputs/CodeBERT/cvefixes_cwe20_0-512",
+    "input_json": "data/user_demo_chunks/user_demo_chunks_0-512_test.json",
+    "block_size": 512,
+    "device": "cpu"
+  }'
+```
+
+### 2.6 `GET /api/meta/frontend-input-json-options`
+
+用途：给前端提供 `input_json` 下拉候选，只扫描：
+
+- `data/` 下一级目录名以 `user_` 开头的目录
+- 这些目录里的 `.json` 文件
+
+返回的 `path` 是仓库相对路径，前端可直接回填到
+`POST /api/frontend/code-inference-file` 的 `input_json` 字段。
+
+成功响应示例：
+
+```json
+{
+  "items": [
+    {
+      "label": "user_demo_chunks_0-512_test.json",
+      "path": "data/user_demo_chunks/user_demo_chunks_0-512_test.json"
+    },
+    {
+      "label": "user_xxx_0-512_test.json",
+      "path": "data/user_xxx/user_xxx_0-512_test.json"
+    }
+  ]
+}
+```
+
+调用示例：
+
+```bash
+curl http://127.0.0.1:8000/api/meta/frontend-input-json-options
+```
+
+### 2.7 `GET /api/frontend/user-data`
+
+用途：只浏览 `data/` 下 `user_` 前缀目录及其内容。  
+适合前端拿切分结果、原始请求文件、示例文件，或者为 `chunk-review` 回取 code 内容。
+
+接口行为：
+
+- 不传 `relative_path` 时：返回 `data/` 下所有 `user_` 前缀目录
+- 传 `relative_path=user_xxx` 时：返回该目录下的文件列表
+- 只允许访问 `data/user_*` 作用域，不会越界到其他目录
+
+根目录示例：
+
+```bash
+curl "http://127.0.0.1:8000/api/frontend/user-data"
+```
+
+查看某个用户目录示例：
+
+```bash
+curl "http://127.0.0.1:8000/api/frontend/user-data?relative_path=user_demo_chunks"
+```
+
+### 2.8 `GET /api/frontend/user-data/text`
+
+用途：读取 `data/user_*` 目录下某个文本文件内容。
+
+调用示例：
+
+```bash
+curl "http://127.0.0.1:8000/api/frontend/user-data/text?relative_path=user_demo_chunks/chunking_request.json"
+```
+
+### 2.9 `GET /api/frontend/user-outputs`
+
+用途：只浏览 `outputs/` 下 `user_` 前缀目录及其内容。  
+适合前端查看文件批量推理结果、后续汇总文件等。
+
+接口行为：
+
+- 不传 `relative_path` 时：返回 `outputs/` 下所有 `user_` 前缀目录
+- 传 `relative_path=user_xxx` 时：返回该目录下的文件列表
+- 只允许访问 `outputs/user_*` 作用域
+
+调用示例：
+
+```bash
+curl "http://127.0.0.1:8000/api/frontend/user-outputs"
+curl "http://127.0.0.1:8000/api/frontend/user-outputs?relative_path=user_demo_chunks"
+```
+
+### 2.10 `GET /api/frontend/user-outputs/text`
+
+用途：读取 `outputs/user_*` 目录下某个文本文件内容。
+
+调用示例：
+
+```bash
+curl "http://127.0.0.1:8000/api/frontend/user-outputs/text?relative_path=user_demo_chunks/user_demo_chunks_0-512_test_CodeBERT_frontend_inference.json"
+```
+
+### 2.11 `POST /api/frontend/code-chunking`
 
 用途：给前端直接提交单段代码或多段代码，返回纯分割结果。  
 这个接口只做代码分块，不做前后版本对比，也不会筛选“漏洞位置”相关片段。
@@ -340,6 +505,8 @@ console.log(result.prediction, result.vulnerability_probability);
 - 对支持 ASTChunk 的语言优先走 AST 分割
 - AST 分割失败或语言不支持时，退回固定行数分割
 - 如果某个 chunk 超过 `max_tokens`，会继续向下拆分
+- 前端需要额外传入一个 `folder_name`
+- 后端会在 `data/user_<folder_name>/` 下保存切分请求、完整切分结果、前 5 个示例
 - 同步返回全部 chunk 结果，不走 `job_id`
 
 单代码请求体示例：
@@ -347,6 +514,7 @@ console.log(result.prediction, result.vulnerability_probability);
 ```json
 {
   "code": "int main() {\n  char buf[8];\n  gets(buf);\n  return 0;\n}",
+  "folder_name": "demo_chunks",
   "language": "c",
   "filename": "main.c",
   "sample_id": "demo-1",
@@ -360,6 +528,7 @@ console.log(result.prediction, result.vulnerability_probability);
 
 ```json
 {
+  "folder_name": "demo_chunks",
   "items": [
     {
       "sample_id": "sample-1",
@@ -384,8 +553,32 @@ console.log(result.prediction, result.vulnerability_probability);
 
 ```json
 {
+  "folder_name": "user_demo_chunks",
+  "storage_dir": "/home/zjr123/LLM4CVD-main/data/user_demo_chunks",
   "total_inputs": 1,
   "total_chunks": 1,
+  "chunks": [
+    {
+      "sample_id": "demo-1",
+      "filename": "main.c",
+      "chunk_index": 0,
+      "text": "int main() {\n  char buf[8];\n  gets(buf);\n  return 0;\n}",
+      "start_line": 1,
+      "end_line": 5,
+      "token_count": 22
+    }
+  ],
+  "examples": [
+    {
+      "sample_id": "demo-1",
+      "filename": "main.c",
+      "chunk_index": 0,
+      "text": "int main() {\n  char buf[8];\n  gets(buf);\n  return 0;\n}",
+      "start_line": 1,
+      "end_line": 5,
+      "token_count": 22
+    }
+  ],
   "results": [
     {
       "sample_id": "demo-1",
@@ -414,12 +607,22 @@ console.log(result.prediction, result.vulnerability_probability);
 
 返回字段说明：
 
+- `folder_name`: 实际保存使用的目录名，格式固定为 `user_<folder_name>`
+- `storage_dir`: 切分结果保存目录
 - `total_inputs`: 本次处理的代码样本数
 - `total_chunks`: 全部样本切出来的 chunk 总数
+- `chunks`: 顶层平铺后的 chunk 列表，方便前端直接渲染单次结果或批量总览
+- `examples`: 返回前 5 个 chunk 示例，方便前端做切分结果预览
 - `chunk_source`: 实际使用的分割方式，例如 `ast:python`、`fallback:cpp`
 - `normalized_language`: 规范化后的语言名
 - `chunks[].start_line` / `chunks[].end_line`: 该 chunk 对应的原始代码行号范围
 - `chunks[].token_count`: 该 chunk 的 token 数
+
+落盘文件说明：
+
+- `data/user_<folder_name>/chunking_request.json`: 前端原始请求
+- `data/user_<folder_name>/user_<folder_name>_0-<max_tokens>_test.json`: 完整切分结果
+- `data/user_<folder_name>/chunking_examples.json`: 前 5 个示例
 
 适合的前端使用方式：
 
@@ -434,8 +637,110 @@ curl -X POST http://127.0.0.1:8000/api/frontend/code-chunking \
   -H "Content-Type: application/json" \
   -d '{
     "code": "int main() {\n  char buf[8];\n  gets(buf);\n  return 0;\n}",
+    "folder_name": "demo_chunks",
     "language": "c",
     "filename": "main.c"
+  }'
+```
+
+### 2.12 `POST /api/frontend/chunk-review`
+
+用途：给前端直接提交“完整代码 + 小模型判为可疑的 chunk”，让大模型在完整语境下复核这些 chunk 是否真的存在漏洞。  
+这是一个全新的同步接口，不会影响现有 `LLM_TEST/llm_api_judge.py` 和 `/api/jobs/llm-test/judge` 的旧流程。
+
+接口行为：
+
+- 前端传入完整代码 `code`
+- 前端传入一个或多个小模型判为可疑的 `chunks`
+- 后端会对每个 chunk 单独调用一次大模型
+- 每次提示词里只包含两段代码：`1. 当前 chunk`，`2. 该 chunk 所属的完整原代码`
+- 最终返回整体漏洞判断，以及逐 chunk 的复核结果
+
+请求体示例：
+
+```json
+{
+  "code": "int main() {\n  char buf[8];\n  gets(buf);\n  return 0;\n}",
+  "language": "c",
+  "prompt_file": "LLM_TEST/Prompt/CWE-119_0.5.txt",
+  "model": "deepseek-chat",
+  "chunks": [
+    {
+      "chunk_id": "chunk-1",
+      "text": "char buf[8];\ngets(buf);",
+      "start_line": 2,
+      "end_line": 3,
+      "prediction": 1,
+      "vulnerability_probability": 0.91
+    }
+  ],
+  "temperature": 0.0,
+  "max_tokens": 512,
+  "timeout": 120
+}
+```
+
+成功响应示例：
+
+```json
+{
+  "model": "deepseek-chat",
+  "prompt_file": "/home/zjr123/LLM4CVD-main/LLM_TEST/Prompt/CWE-119_0.5.txt",
+  "prediction": 1,
+  "is_vulnerable": true,
+  "parse_status": "json.vulnerable",
+  "parsed_response": {
+    "vulnerable": "yes",
+    "cwe": "CWE-242",
+    "reason": "gets reads unbounded input into a fixed-size buffer."
+  },
+  "chunk_verdicts": [
+    {
+      "chunk_id": "chunk-1",
+      "prediction": 1,
+      "vulnerable": "yes",
+      "cwe": "CWE-242",
+      "reason": "gets reads unbounded input into a fixed-size buffer.",
+      "parse_status": "json.vulnerable",
+      "start_line": 2,
+      "end_line": 3,
+      "raw_response": "{\"vulnerable\":\"yes\",\"cwe\":\"CWE-242\",\"reason\":\"...\"}"
+    }
+  ],
+  "raw_response": "[chunk-1] {\"vulnerable\":\"yes\",\"cwe\":\"CWE-242\",\"reason\":\"...\"}",
+  "chunk_count": 1
+}
+```
+
+返回字段说明：
+
+- `prediction`: 整体判定，`1` 表示存在漏洞，`0` 表示不存在漏洞
+- `is_vulnerable`: `prediction` 的布尔形式
+- `chunk_verdicts`: 逐个可疑 chunk 的复核结果
+- `parsed_response`: 单 chunk 请求时，对该 chunk 的解析结果；多 chunk 时为空
+- `chunk_verdicts[].raw_response`: 该 chunk 单独调用大模型后的原始返回
+- `raw_response`: 全部 chunk 原始返回的汇总文本
+- `chunk_count`: 本次送审的可疑 chunk 数量
+
+调用示例：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/frontend/chunk-review \
+  -H "Content-Type: application/json" \
+  -d '{
+    "code": "int main() {\n  char buf[8];\n  gets(buf);\n  return 0;\n}",
+    "language": "c",
+    "prompt_file": "LLM_TEST/Prompt/CWE-119_0.5.txt",
+    "chunks": [
+      {
+        "chunk_id": "chunk-1",
+        "text": "char buf[8];\ngets(buf);",
+        "start_line": 2,
+        "end_line": 3,
+        "prediction": 1,
+        "vulnerability_probability": 0.91
+      }
+    ]
   }'
 ```
 

@@ -177,6 +177,7 @@ class FrontendCodeChunkRequest(BaseModel):
     language: Optional[str] = None
     filename: Optional[str] = None
     sample_id: Optional[str] = None
+    folder_name: str = Field(..., min_length=1)
     items: Optional[list[FrontendCodeChunkItem]] = None
     max_chars: int = Field(default=1800, ge=128, le=20000)
     max_tokens: int = Field(default=512, ge=8, le=4096)
@@ -206,9 +207,33 @@ class FrontendCodeChunkResult(BaseModel):
     chunks: list[FrontendCodeChunk]
 
 
+class FrontendCodeChunkExample(BaseModel):
+    sample_id: Optional[str] = None
+    filename: Optional[str] = None
+    chunk_index: int
+    text: str
+    start_line: int
+    end_line: int
+    token_count: int
+
+
+class FrontendCodeChunkFlat(BaseModel):
+    sample_id: Optional[str] = None
+    filename: Optional[str] = None
+    chunk_index: int
+    text: str
+    start_line: int
+    end_line: int
+    token_count: int
+
+
 class FrontendCodeChunkResponse(BaseModel):
+    folder_name: str
+    storage_dir: str
     total_inputs: int
     total_chunks: int
+    chunks: list[FrontendCodeChunkFlat]
+    examples: list[FrontendCodeChunkExample]
     results: list[FrontendCodeChunkResult]
 
 
@@ -275,6 +300,23 @@ class FileOption(BaseModel):
     path: str
 
 
+class FrontendFindCodeRequest(BaseModel):
+    relative_path: str = Field(..., min_length=1)
+    sample_id: Optional[str] = None
+    filename: Optional[str] = None
+
+
+class FrontendFindCodeResponse(BaseModel):
+    sample_id: Optional[str] = None
+    filename: Optional[str] = None
+    language: Optional[str] = None
+    code: str
+
+
+class FrontendInputJsonOptionsResponse(BaseModel):
+    items: list[FileOption]
+
+
 class LLMTestOptionsResponse(BaseModel):
     config_files: list[str]
     env_files: list[str]
@@ -313,3 +355,36 @@ class FrontendCodeInferenceResponse(BaseModel):
     non_vulnerable_probability: float
     temp_dir: str
     input_json: str
+
+
+class FrontendCodeInferenceFileRequest(BaseModel):
+    model_name: Literal["CodeBERT", "UniXcoder"]
+    checkpoint_dir: str = Field(..., min_length=1)
+    input_json: str = Field(..., min_length=1)
+    block_size: int = Field(default=512, ge=8, le=4096)
+    instruction: str = "Detect whether the following code contains vulnerabilities."
+    device: Literal["auto", "cpu", "cuda"] = "auto"
+    preview_limit: int = Field(default=20, ge=1, le=200)
+
+
+class FrontendCodeInferenceFileItem(BaseModel):
+    index: int
+    sample_id: Optional[str] = None
+    filename: Optional[str] = None
+    chunk_index: Optional[int] = None
+    prediction: Literal[1]
+    vulnerability_probability: float
+    code: str
+
+
+class FrontendCodeInferenceFileResponse(BaseModel):
+    model_name: Literal["CodeBERT", "UniXcoder"]
+    checkpoint_dir: str
+    checkpoint_file: str
+    device: str
+    input_json: str
+    result_json: str
+    result_csv: str
+    total_samples: int
+    vulnerable_samples: int
+    preview: list[FrontendCodeInferenceFileItem]

@@ -78,7 +78,23 @@ def parse_args() -> argparse.Namespace:
         help="Only process the first N samples from the input JSON.",
     )
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max_tokens", type=int, default=256)
+    parser.add_argument(
+        "--max_tokens",
+        type=int,
+        default=None,
+        help="Maximum output tokens. When omitted, do not send max_tokens to the API.",
+    )
+    parser.add_argument(
+        "--response_format",
+        choices=("text", "json_object", "json_schema"),
+        default="text",
+        help="Response format passed to OpenAI-compatible APIs.",
+    )
+    parser.add_argument(
+        "--json_schema_file",
+        default=None,
+        help="Path to a JSON file used when --response_format json_schema.",
+    )
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--sleep_seconds", type=float, default=1.0)
@@ -102,7 +118,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Reuse existing outputs in the target directory and skip completed sample indexes.",
+        help="Reuse existing outputs in the target directory and skip only successfully completed sample indexes.",
     )
     return parser.parse_args()
 
@@ -117,6 +133,14 @@ def load_json(path: Path) -> List[dict]:
 def ensure_text(path: Path) -> str:
     with path.open("r", encoding="utf-8") as handle:
         return handle.read().strip()
+
+
+def load_json_object(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected a JSON object in {path}, got {type(payload).__name__}.")
+    return payload
 
 
 def normalize_prompt_template(prompt_template: str) -> str:
@@ -143,6 +167,29 @@ def build_user_prompt(prompt_template: str, code: str) -> str:
     )
 
 
+def extract_text_segments(content: object) -> List[str]:
+    if isinstance(content, str):
+        return [content.strip()] if content.strip() else []
+    if not isinstance(content, list):
+        return []
+
+    text_parts: List[str] = []
+    for item in content:
+        if isinstance(item, dict):
+            item_type = str(item.get("type", "")).strip().lower()
+            if item_type in {"reasoning", "thinking", "reasoning_content"}:
+                continue
+            if isinstance(item.get("text"), str) and item["text"].strip():
+                text_parts.append(item["text"].strip())
+                continue
+            if item_type in {"text", "output_text"} and isinstance(item.get("content"), str):
+                if item["content"].strip():
+                    text_parts.append(item["content"].strip())
+        elif isinstance(item, str) and item.strip():
+            text_parts.append(item.strip())
+    return text_parts
+
+
 def extract_text_from_response(payload: dict) -> str:
     choices = payload.get("choices", [])
     if not choices:
@@ -151,38 +198,34 @@ def extract_text_from_response(payload: dict) -> str:
     first = choices[0]
     message = first.get("message", {})
     if isinstance(message, dict):
-        content = message.get("content")
-        if isinstance(content, str) and content.strip():
-            return content.strip()
-        if isinstance(content, list):
-            text_parts: List[str] = []
-            for item in content:
-                if isinstance(item, dict):
-                    if isinstance(item.get("text"), str) and item["text"].strip():
-                        text_parts.append(item["text"].strip())
-                    elif item.get("type") == "text" and isinstance(item.get("content"), str):
-                        if item["content"].strip():
-                            text_parts.append(item["content"].strip())
-                elif isinstance(item, str) and item.strip():
-                    text_parts.append(item.strip())
-            if text_parts:
-                return "\n".join(text_parts)
-
-        reasoning_content = message.get("reasoning_content")
-        if isinstance(reasoning_content, str) and reasoning_content.strip():
-            return reasoning_content.strip()
+        text_parts = extract_text_segments(message.get("content"))
+        if text_parts:
+            return "\n".join(text_parts)
 
     text = first.get("text")
     return str(text).strip() if text is not None else ""
 
 
-def try_parse_json_block(text: str) -> Optional[dict]:
-    fenced = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
-    candidates = [fenced.group(1)] if fenced else []
+def extract_json_candidates(text: str) -> List[str]:
+    candidates: List[str] = []
 
-    braces = re.search(r"(\{.*\})", text, flags=re.DOTALL)
-    if braces:
-        candidates.append(braces.group(1))
+    fenced_matches = re.findall(r"```json\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    candidates.extend(fenced_matches)
+
+    decoder = json.JSONDecoder()
+    for start, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            _, end = decoder.raw_decode(text[start:])
+            candidates.append(text[start : start + end])
+        except json.JSONDecodeError:
+            continue
+    return candidates
+
+
+def try_parse_json_block(text: str) -> Optional[dict]:
+    candidates = extract_json_candidates(text)
 
     for candidate in candidates:
         try:
@@ -190,6 +233,28 @@ def try_parse_json_block(text: str) -> Optional[dict]:
         except json.JSONDecodeError:
             continue
     return None
+
+
+def select_final_response_text(text: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return ""
+
+    candidates = extract_json_candidates(stripped)
+    for candidate in reversed(candidates):
+        try:
+            json.loads(candidate)
+            return candidate.strip()
+        except json.JSONDecodeError:
+            continue
+
+    non_empty_lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if non_empty_lines:
+        last_line = non_empty_lines[-1]
+        if re.fullmatch(r"(?i)yes|true|1|no|false|0", last_line):
+            return last_line
+
+    return stripped
 
 
 def parse_binary_label(text: str) -> Tuple[Optional[int], Optional[str]]:
@@ -232,6 +297,8 @@ def is_retryable_exception(exc: Exception) -> bool:
         return True
     if isinstance(exc, ValueError):
         message = str(exc)
+        if re.match(r"^HTTP 429\b", message):
+            return True
         if re.match(r"^HTTP 4\d\d\b", message):
             return False
     return True
@@ -243,7 +310,8 @@ def call_chat_completion(
     model: str,
     user_prompt: str,
     temperature: float,
-    max_tokens: int,
+    max_tokens: Optional[int],
+    response_format: Optional[dict],
     timeout: int,
 ) -> dict:
     url = api_base.rstrip("/") + "/chat/completions"
@@ -251,7 +319,6 @@ def call_chat_completion(
         "model": model,
         "stream": False,
         "temperature": temperature,
-        "max_tokens": max_tokens,
         "messages": [
             {
                 "role": "system",
@@ -260,6 +327,10 @@ def call_chat_completion(
             {"role": "user", "content": user_prompt},
         ],
     }
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
+    if response_format is not None:
+        body["response_format"] = response_format
 
     request = urllib.request.Request(
         url=url,
@@ -355,6 +426,22 @@ def index_existing_judgments(rows: List[dict]) -> Dict[int, dict]:
     return indexed
 
 
+def is_successful_judgment_row(row: Optional[dict]) -> bool:
+    if not row:
+        return False
+    parse_status = str(row.get("parse_status", "")).strip()
+    llm_prediction = to_int(row.get("llm_prediction"))
+    return not parse_status.startswith("error:") and llm_prediction in (0, 1)
+
+
+def is_successful_csv_row(row: Optional[dict]) -> bool:
+    if not row:
+        return False
+    parse_status = str(row.get("ParseStatus", "")).strip()
+    llm_prediction = to_int(row.get("LLMPrediction"))
+    return not parse_status.startswith("error:") and llm_prediction in (0, 1)
+
+
 def build_output_name(
     dataset_id: str,
     prompt_file: Path,
@@ -410,7 +497,8 @@ def process_sample(
     prompt_template: str,
     prompt_file: Path,
     temperature: float,
-    max_tokens: int,
+    max_tokens: Optional[int],
+    response_format: Optional[dict],
     timeout: int,
     retries: int,
     sleep_seconds: float,
@@ -418,6 +506,7 @@ def process_sample(
     user_prompt = build_user_prompt(prompt_template, sample.get("input", ""))
 
     response_text = ""
+    raw_response_text = ""
     parse_status = "unparsed"
     llm_prediction: Optional[int] = None
 
@@ -430,9 +519,11 @@ def process_sample(
                 user_prompt=user_prompt,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                response_format=response_format,
                 timeout=timeout,
             )
-            response_text = extract_text_from_response(payload)
+            raw_response_text = extract_text_from_response(payload)
+            response_text = select_final_response_text(raw_response_text)
             llm_prediction, parse_source = parse_binary_label(response_text)
             parse_status = parse_source or "unparsed"
             if llm_prediction is None:
@@ -445,10 +536,10 @@ def process_sample(
             TimeoutError,
             ValueError,
         ) as exc:
-            last_error = summarize_error(exc, response_text)
+            last_error = summarize_error(exc, raw_response_text or response_text)
             should_retry = is_retryable_exception(exc)
             if attempt == retries or not should_retry:
-                response_text = response_text or last_error or ""
+                response_text = response_text or raw_response_text or last_error or ""
                 parse_status = f"error:{type(exc).__name__}"
                 llm_prediction = None
             else:
@@ -486,10 +577,29 @@ def main() -> None:
     api_key = resolve_value(args.api_key, llm_cfg, "api_key", os.environ.get(api_key_env))
     output_root = resolve_value(args.output_root, common_cfg, "output_root", "LLM_TEST/output")
     temperature = float(resolve_value(args.temperature, llm_cfg, "temperature", 0.0))
-    max_tokens = int(resolve_value(args.max_tokens, llm_cfg, "max_tokens", 256))
+    max_tokens_value = resolve_value(args.max_tokens, llm_cfg, "max_tokens")
+    max_tokens = int(max_tokens_value) if max_tokens_value not in (None, "") else None
+    response_format_type = str(resolve_value(args.response_format, llm_cfg, "response_format", "text"))
     timeout = int(resolve_value(args.timeout, llm_cfg, "timeout", 120))
     retries = int(resolve_value(args.retries, llm_cfg, "retries", 3))
     sleep_seconds = float(resolve_value(args.sleep_seconds, llm_cfg, "sleep_seconds", 1.0))
+    response_format: Optional[dict] = None
+
+    if response_format_type == "json_object":
+        response_format = {"type": "json_object"}
+    elif response_format_type == "json_schema":
+        json_schema_file_value = resolve_value(args.json_schema_file, llm_cfg, "json_schema_file")
+        if not json_schema_file_value:
+            raise ValueError("--json_schema_file is required when --response_format json_schema.")
+        json_schema_file = Path(json_schema_file_value).resolve()
+        if not json_schema_file.exists():
+            raise FileNotFoundError(f"JSON schema file not found: {json_schema_file}")
+        response_format = {
+            "type": "json_schema",
+            "json_schema": load_json_object(json_schema_file),
+        }
+    elif response_format_type != "text":
+        raise ValueError(f"Unsupported response_format: {response_format_type}")
 
     if not api_key:
         raise ValueError(
@@ -556,7 +666,11 @@ def main() -> None:
         sample_index = int(sample["index"])
         if args.start_index is not None and sample_index < args.start_index:
             continue
-        if args.resume and judgments_by_order[order] is not None and csv_by_order[order] is not None:
+        if (
+            args.resume
+            and is_successful_judgment_row(judgments_by_order[order])
+            and is_successful_csv_row(csv_by_order[order])
+        ):
             continue
         pending_orders.append(order)
 
@@ -574,6 +688,7 @@ def main() -> None:
                 prompt_file=prompt_file,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                response_format=response_format,
                 timeout=timeout,
                 retries=retries,
                 sleep_seconds=sleep_seconds,
@@ -610,6 +725,7 @@ def main() -> None:
                     prompt_file=prompt_file,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    response_format=response_format,
                     timeout=timeout,
                     retries=retries,
                     sleep_seconds=sleep_seconds,
@@ -653,6 +769,7 @@ def main() -> None:
             "input_json": str(input_json),
             "prompt_file": str(prompt_file),
             "model": model,
+            "response_format": response_format_type,
             "total_samples": len(positive_samples),
             "parsed_predictions": sum(row["llm_prediction"] in (0, 1) for row in judgment_rows),
             "output_dir": str(output_dir),

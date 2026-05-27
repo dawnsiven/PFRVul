@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import csv
 import json
 import threading
 import uuid
@@ -17,6 +18,7 @@ from fastapi_backend.job_runner import REPO_ROOT
 
 InferenceModelName = Literal["CodeBERT", "UniXcoder"]
 TEMP_INFERENCE_ROOT = REPO_ROOT / "data" / "temp_inference"
+OUTPUTS_ROOT = REPO_ROOT / "outputs"
 DEFAULT_INSTRUCTION = "Detect whether the following code contains vulnerabilities."
 
 _MODULE_CACHE: dict[str, ModuleType] = {}
@@ -199,6 +201,38 @@ def run_single_inference(
         device_name=device_name,
     )
 
+    prediction, vulnerability_probability, non_vulnerable_probability = _predict_code(
+        loaded=loaded,
+        model_name=model_name,
+        code=code,
+        block_size=block_size,
+    )
+    result = {
+        "model_name": model_name,
+        "checkpoint_dir": str(loaded.checkpoint_dir),
+        "checkpoint_file": str(loaded.checkpoint_file),
+        "device": str(loaded.device),
+        "prediction": prediction,
+        "is_vulnerable": bool(prediction == 1),
+        "vulnerability_probability": vulnerability_probability,
+        "non_vulnerable_probability": non_vulnerable_probability,
+        "temp_dir": str(temp_dir),
+        "input_json": str(input_json_path),
+    }
+    (temp_dir / "prediction.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return result
+
+
+def _predict_code(
+    *,
+    loaded: _LoadedModel,
+    model_name: InferenceModelName,
+    code: str,
+    block_size: int,
+) -> tuple[int, float, float]:
     normalized_code = _normalize_code(code)
     if model_name == "CodeBERT":
         tokens = loaded.tokenizer.tokenize(normalized_code)[: block_size - 2]
@@ -229,21 +263,172 @@ def run_single_inference(
         non_vulnerable_probability = float(probs[0])
         vulnerability_probability = float(probs[1])
         prediction = int(vulnerability_probability >= non_vulnerable_probability)
+    return prediction, vulnerability_probability, non_vulnerable_probability
 
-    result = {
+
+def _load_inference_items(input_json_path: Path) -> list[dict[str, object]]:
+    payload = json.loads(input_json_path.read_text(encoding="utf-8"))
+    items: list[dict[str, object]] = []
+
+    if isinstance(payload, dict) and isinstance(payload.get("results"), list):
+        running_index = 0
+        for result in payload["results"]:
+            if not isinstance(result, dict):
+                continue
+            sample_id = result.get("sample_id")
+            filename = result.get("filename")
+            for chunk in result.get("chunks", []):
+                if not isinstance(chunk, dict):
+                    continue
+                code = str(chunk.get("text") or "").strip()
+                if not code:
+                    continue
+                items.append(
+                    {
+                        "index": running_index,
+                        "sample_id": sample_id,
+                        "filename": filename,
+                        "chunk_index": chunk.get("index"),
+                        "code": code,
+                        "source_item": {
+                            "index": running_index,
+                            "sample_id": sample_id,
+                            "filename": filename,
+                            "chunk_index": chunk.get("index"),
+                            **chunk,
+                        },
+                    }
+                )
+                running_index += 1
+        return items
+
+    if isinstance(payload, list):
+        for running_index, item in enumerate(payload):
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get("input", item.get("code", item.get("text", ""))) or "").strip()
+            if not code:
+                continue
+            items.append(
+                {
+                    "index": int(item.get("index", running_index)),
+                    "sample_id": item.get("sample_id"),
+                    "filename": item.get("filename"),
+                    "chunk_index": item.get("chunk_index"),
+                    "code": code,
+                    "source_item": dict(item),
+                }
+            )
+        return items
+
+    raise ValueError("Unsupported input_json format for file inference.")
+
+
+def run_file_inference(
+    *,
+    model_name: InferenceModelName,
+    checkpoint_dir: Path,
+    input_json_path: Path,
+    block_size: int = 512,
+    device_name: str = "auto",
+    preview_limit: int = 20,
+) -> dict[str, object]:
+    loaded = get_loaded_model(
+        model_name=model_name,
+        checkpoint_dir=checkpoint_dir,
+        device_name=device_name,
+    )
+    inference_items = _load_inference_items(input_json_path)
+    if not inference_items:
+        raise ValueError(f"No code samples found in {input_json_path}")
+
+    result_rows: list[dict[str, object]] = []
+    for item in inference_items:
+        prediction, vulnerability_probability, non_vulnerable_probability = _predict_code(
+            loaded=loaded,
+            model_name=model_name,
+            code=str(item["code"]),
+            block_size=block_size,
+        )
+        result_rows.append(
+            {
+                "index": int(item["index"]),
+                "sample_id": item.get("sample_id"),
+                "filename": item.get("filename"),
+                "chunk_index": item.get("chunk_index"),
+                "prediction": prediction,
+                "is_vulnerable": bool(prediction == 1),
+                "vulnerability_probability": vulnerability_probability,
+                "non_vulnerable_probability": non_vulnerable_probability,
+                "code": str(item["code"]),
+            }
+        )
+
+    positive_rows = [row for row in result_rows if row["prediction"] == 1]
+    simplified_positive_rows: list[dict[str, object]] = []
+    for row, source in zip(result_rows, inference_items):
+        if row["prediction"] != 1:
+            continue
+        source_item = source.get("source_item")
+        merged_row: dict[str, object] = {}
+        if isinstance(source_item, dict):
+            merged_row.update(source_item)
+        merged_row.update(
+            {
+                "index": int(row["index"]),
+                "sample_id": row.get("sample_id"),
+                "filename": row.get("filename"),
+                "chunk_index": row.get("chunk_index"),
+                "prediction": 1,
+                "vulnerability_probability": float(row["vulnerability_probability"]),
+                "code": str(row["code"]),
+            }
+        )
+        simplified_positive_rows.append(merged_row)
+
+    output_dir = OUTPUTS_ROOT / input_json_path.parent.name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    result_stem = f"{input_json_path.stem}_{model_name}_frontend_inference"
+    result_json = output_dir / f"{result_stem}.json"
+    result_csv = output_dir / f"{result_stem}.csv"
+    summary = {
         "model_name": model_name,
         "checkpoint_dir": str(loaded.checkpoint_dir),
         "checkpoint_file": str(loaded.checkpoint_file),
         "device": str(loaded.device),
-        "prediction": prediction,
-        "is_vulnerable": bool(prediction == 1),
-        "vulnerability_probability": vulnerability_probability,
-        "non_vulnerable_probability": non_vulnerable_probability,
-        "temp_dir": str(temp_dir),
         "input_json": str(input_json_path),
+        "result_json": str(result_json),
+        "result_csv": str(result_csv),
+        "total_samples": len(result_rows),
+        "vulnerable_samples": len(simplified_positive_rows),
+        "results": simplified_positive_rows,
     }
-    (temp_dir / "prediction.json").write_text(
-        json.dumps(result, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    return result
+    result_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    fieldnames = [
+        "index",
+        "sample_id",
+        "filename",
+        "chunk_index",
+        "prediction",
+        "vulnerability_probability",
+        "code",
+    ]
+    csv_rows = [{field: row.get(field) for field in fieldnames} for row in simplified_positive_rows]
+    with result_csv.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(csv_rows)
+
+    return {
+        "model_name": model_name,
+        "checkpoint_dir": str(loaded.checkpoint_dir),
+        "checkpoint_file": str(loaded.checkpoint_file),
+        "device": str(loaded.device),
+        "input_json": str(input_json_path),
+        "result_json": str(result_json),
+        "result_csv": str(result_csv),
+        "total_samples": len(result_rows),
+        "vulnerable_samples": len(simplified_positive_rows),
+        "preview": simplified_positive_rows[:preview_limit],
+    }
