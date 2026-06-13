@@ -266,6 +266,9 @@ def evaluate(args, model, tokenizer, data_file):
 def test(args, model, tokenizer, data_file):
     """ Evaluate the model """
     eval_dataset = TextDataset(tokenizer, args, data_file)
+    with open(data_file, 'r') as json_file:
+        data = json.load(json_file)
+        index_list = [item.get('index') for item in data]
     eval_sampler = SequentialSampler(eval_dataset)
     eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, num_workers=4)
 
@@ -309,16 +312,21 @@ def test(args, model, tokenizer, data_file):
     # 确保 CWE 列表的长度与其他数据相匹配
     if len(cwe_list) != len(labels):
         raise ValueError("CWE 列表的长度与标签的长度不匹配")
+    if len(index_list) != len(labels):
+        raise ValueError("Index 列表的长度与标签的长度不匹配")
 
     if not os.path.exists(args.csv_path):
         with open(args.csv_path, 'w') as f:
-            f.write('CWE,Label,Prediction,Prob\n')
+            f.write('Index,CWE,Label,Prediction,Prob\n')
 
-    probs2 = [[prob[0], 1 - prob[0]] for prob in probs]
-    temp_df = pd.DataFrame({'CWE': [], 'Label': [], 'Prediction': [], 'Prob': []})
+    # probs2 = [[prob[0],prob[1]] for prob in probs]
+    probs2 = [prob[1] for prob in probs]
+    # probs2 = [[prob[0], 1 - prob[0]] for prob in probs]
+    # probs2 = 1 -np.abs(probs[:,1] - probs[:,0])
+    temp_df = pd.DataFrame({'Index': [], 'CWE': [], 'Label': [], 'Prediction': [], 'Prob': []})
     temp_df.to_csv(args.csv_path, index=False, mode='w', header=True)
-    for cwe, label, pred, prob in zip(cwe_list, labels, preds, probs2):
-        temp_df = pd.DataFrame({'CWE': [cwe], 'Label': [label], 'Prediction': [pred], 'Prob': [prob]})
+    for index, cwe, label, pred, prob in zip(index_list, cwe_list, labels, preds, probs2):
+        temp_df = pd.DataFrame({'Index': [index], 'CWE': [cwe], 'Label': [label], 'Prediction': [pred], 'Prob': [prob]})
         temp_df.to_csv(args.csv_path, index=False, mode='a', header=False)
 
     result = {

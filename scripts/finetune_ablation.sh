@@ -21,12 +21,14 @@ MODEL_MAP["llama3"]='meta-llama/Meta-Llama-3-8B'
 MODEL_MAP["llama3.1"]='meta-llama/Llama-3.1-8B'
 MODEL_MAP["llama2"]="meta-llama/Llama-2-7b-hf"
 MODEL_MAP["codellama"]="codellama/CodeLlama-7b-hf"
+MODEL_MAP["llama3.2"]='meta-llama/Llama-3.2-1B'
 
 declare -A BATCH_MAP
 BATCH_MAP["llama2"]=16
 BATCH_MAP["codellama"]=16
 BATCH_MAP["llama3"]=16
 BATCH_MAP["llama3.1"]=16
+BATCH_MAP["llama3.2"]=2
 
 mkdir -p "outputs/${MODEL_NAME}_lora_ablation/${DATASET_NAME}_${R}_${ALPHA}/"
 

@@ -43,8 +43,8 @@ CUDA_VISIBLE_DEVICES="${CUDA}" python ${MODEL_NAME}/run.py \
     --test_data_file="data/${DATASET_NAME}/alpaca/${DATASET_NAME}_${LENGTH}_test.json" \
     --epoch 5 \
     --block_size $(echo $LENGTH | awk -F'-' '{print $2}') \
-    --train_batch_size 32 \
-    --eval_batch_size 64 \
+    --train_batch_size 4 \
+    --eval_batch_size 4 \
     --evaluate_during_training \
     --seed 42 \
     2>"outputs/${MODEL_NAME}/${DATASET_NAME}_${LENGTH}/train_${MODEL_NAME}_${DATASET_NAME}_${LENGTH}.log"
@@ -61,8 +61,8 @@ CUDA_VISIBLE_DEVICES="${CUDA}" python ${MODEL_NAME}/run.py \
     --test_data_file="data/${DATASET_NAME}/alpaca/${DATASET_NAME}_${LENGTH}_test.json" \
     --num_train_epochs 5 \
     --block_size $(echo $LENGTH | awk -F'-' '{print $2}') \
-    --train_batch_size 32 \
-    --eval_batch_size 64 \
+    --train_batch_size 4 \
+    --eval_batch_size 4 \
     --seed 42 \
     2>"outputs/${MODEL_NAME}/${DATASET_NAME}_${LENGTH}/train_${MODEL_NAME}_${DATASET_NAME}_${LENGTH}.log"
 else
@@ -80,8 +80,8 @@ CUDA_VISIBLE_DEVICES="${CUDA}" python ${MODEL_NAME}/run.py \
     --test_data_file="data/${DATASET_NAME}/alpaca/${DATASET_NAME}_${LENGTH}_test.json" \
     --epoch 5 \
     --block_size $(echo $LENGTH | awk -F'-' '{print $2}') \
-    --train_batch_size 32 \
-    --eval_batch_size 64 \
+    --train_batch_size 4 \
+    --eval_batch_size 4 \
     --evaluate_during_training \
     --seed 42 \
     2>"outputs/${MODEL_NAME}/${DATASET_NAME}_${LENGTH}/train_${MODEL_NAME}_${DATASET_NAME}_${LENGTH}.log"

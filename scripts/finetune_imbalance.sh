@@ -20,20 +20,21 @@ MODEL_MAP["llama3"]='meta-llama/Meta-Llama-3-8B'
 MODEL_MAP["llama3.1"]='meta-llama/Llama-3.1-8B'
 MODEL_MAP["llama2"]="meta-llama/Llama-2-7b-hf"
 MODEL_MAP["codellama"]="codellama/CodeLlama-7b-hf"
-
+MODEL_MAP["llama3.2"]='meta-llama/Llama-3.2-1B'
 declare -A BATCH_MAP
 BATCH_MAP["llama2"]=16
 BATCH_MAP["codellama"]=16
 BATCH_MAP["llama3"]=16
 BATCH_MAP["llama3.1"]=16
+BATCH_MAP["llama3.2"]=2
 
+LENGTH="0-512"
 mkdir -p "outputs/${MODEL_NAME}_lora_imbalance/${DATASET_NAME}_${POS_RATIO}/"
 
 echo "Batch size: ${BATCH_MAP[$MODEL_NAME]}"
 echo "Pos ratio: $(echo $POS_RATIO)"
-
+    # --quantization \
 CUDA_VISIBLE_DEVICES="${CUDA}" python LLM/finetuning.py \
-    --quantization \
     --use_peft \
     --peft_method lora \
     --batch_size_training ${BATCH_MAP[$MODEL_NAME]} \
@@ -41,7 +42,7 @@ CUDA_VISIBLE_DEVICES="${CUDA}" python LLM/finetuning.py \
     --context_length 512 \
     --num_epochs 5 \
     --model_name ${MODEL_MAP[$MODEL_NAME]} \
-    --alpaca_dataset.train_data_path "data/${DATASET_NAME}_subsampled/alpaca/${DATASET_NAME}_${POS_RATIO}_train.json" \
-    --alpaca_dataset.valid_data_path "data/${DATASET_NAME}_subsampled/alpaca/${DATASET_NAME}_${POS_RATIO}_validate.json" \
+    --alpaca_dataset.train_data_path "data/${DATASET_NAME}_subsampled/alpaca/${DATASET_NAME}_${LENGTH}_${POS_RATIO}_train.json" \
+    --alpaca_dataset.valid_data_path "data/${DATASET_NAME}_subsampled/alpaca/${DATASET_NAME}_${LENGTH}_${POS_RATIO}_validate.json" \
     --output_dir "outputs/${MODEL_NAME}_lora_imbalance/${DATASET_NAME}_${POS_RATIO}/" \
     >"outputs/${MODEL_NAME}_lora_imbalance/${DATASET_NAME}_${POS_RATIO}/finetuning_${MODEL_NAME}_lora_${DATASET_NAME}_${POS_RATIO}.log"

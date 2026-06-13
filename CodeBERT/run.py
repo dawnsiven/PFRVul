@@ -322,6 +322,9 @@ def evaluate(args, model, tokenizer,eval_when_training=False):
 def test(args, model, tokenizer, split="test"):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     eval_dataset = TextDataset(tokenizer, args,args.test_data_file)
+    with open(args.test_data_file, 'r') as json_file:
+        data = json.load(json_file)
+        index_list = [item.get('index') for item in data]
 
 
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
@@ -353,18 +356,22 @@ def test(args, model, tokenizer, split="test"):
 
     logits=np.concatenate(logits,0)
     labels=np.concatenate(labels,0)
+    vul_prob = logits[:,0] 
+    # preds = np.argmax(logits, axis=1)
     preds=logits[:,0]>0.5
     y_trues, y_preds = labels, preds
+    if len(index_list) != len(y_trues):
+        raise ValueError("Index list length does not match labels length")
     acc = accuracy_score(y_trues, y_preds)
     recall = recall_score(y_trues, y_preds)
     precision = precision_score(y_trues, y_preds)
     f1 = f1_score(y_trues, y_preds)
     fpr = fpr_score(y_trues, y_preds)
 
-    temp_df = pd.DataFrame({'Label': [], 'Prediction': []})
+    temp_df = pd.DataFrame({'Index': [], 'Label': [], 'Prediction': [],'prob':[]})
     temp_df.to_csv(args.csv_path, index=False, mode='w', header=True)
-    for label, pred in zip(y_trues, y_preds):
-        temp_df = pd.DataFrame({'Label': [int(label)], 'Prediction': [int(pred)]})
+    for index, label, pred,prob in zip(index_list, y_trues, y_preds,vul_prob):
+        temp_df = pd.DataFrame({'Index': [index], 'Label': [int(label)], 'Prediction': [int(pred)],'prob':[float(prob)]})
         temp_df.to_csv(args.csv_path, index=False, mode='a', header=False)
 
     result = {
@@ -458,7 +465,7 @@ def main(args):
     # Evaluation
     if args.do_eval and args.local_rank in [-1, 0]:
             output_path = os.path.join(args.output_dir, 'checkpoint-best-f1/model.bin')
-            model.load_state_dict(torch.load(output_path))
+            model.load_state_dict(torch.load(output_path, map_location=args.device))
             model.to(args.device)
             result=evaluate(args, model, tokenizer)
             logger.info("***** Eval results *****")
@@ -467,7 +474,7 @@ def main(args):
 
     if args.do_test and args.local_rank in [-1, 0]:
             output_path = os.path.join(args.output_dir, 'checkpoint-best-f1/model.bin')
-            model.load_state_dict(torch.load(output_path))
+            model.load_state_dict(torch.load(output_path, map_location=args.device))
             model.to(args.device)
             test(args, model, tokenizer)
 

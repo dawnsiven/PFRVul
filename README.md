@@ -46,6 +46,7 @@ We provided user-friendly shell scripts to simplify model training and evaluatio
 
 ```shell
 scripts
+├── download_hf_models.py          # Download the Hugging Face models used in this repository into `model/`.
 ├── finetune.sh                     # Fine-tune LLMs for the experiments on Section 6.2 and 6.3.
 ├── inference.sh                    # Evaluate LLMs fine-tuned using `finetune.sh`.
 ├── finetune_imbalance.sh           # Fine-tune LLMs for the experiments on Section 6.4.
@@ -63,8 +64,78 @@ Before using these scripts, you need to:
 1. Use the `cd` command to set the running directory to the root of this repository.
 2. Place all data in the `data/` directory, following the directory structure and file names provided in our open-sourced HuggingFace repository.
 3. Install all dependencies listed in the `requirements.txt` by running the command `pip install -r requirements.txt`.
+4. Download the required Hugging Face base models if you plan to run the LLM-based experiments.
 
 The trained models and output log will be generated in the `outputs/` directory.
+
+If you want to download the Hugging Face models used by this repository into the `model/` directory, you can run:
+
+```shell
+python3 scripts/download_hf_models.py
+```
+
+You can also download only selected models:
+
+```shell
+python3 scripts/download_hf_models.py --models codebert graphcodebert unixcoder llama3.2
+```
+
+If you are in mainland China and want to use the community mirror, you can either pass the mirror shortcut:
+
+```shell
+python3 scripts/download_hf_models.py --mirror china --models codebert unixcoder llama3.2
+```
+
+or set a custom Hugging Face endpoint:
+
+```shell
+export HF_ENDPOINT=https://hf-mirror.com
+python3 scripts/download_hf_models.py --models codebert unixcoder llama3.2
+```
+
+For gated repositories such as Llama / CodeLlama, make sure you have access permission on Hugging Face and set your token before downloading:
+
+```shell
+export HF_TOKEN=your_huggingface_token
+python3 scripts/download_hf_models.py --mirror china --models llama3.2
+```
+
+### FastAPI backend for frontend integration
+
+To let a frontend submit jobs and poll training or inference status, this repository now includes a FastAPI backend in `fastapi_backend/`.
+
+Start the backend from the repository root:
+
+```shell
+pip install -r requirements.txt
+./scripts/run_fastapi.sh 0.0.0.0 8000
+```
+
+After startup, you can open:
+
+- `http://127.0.0.1:8000/docs` for Swagger UI
+http://127.0.0.1:8000/docs
+
+- `http://192.168.3.6:8000/health` for a health check
+
+The main API groups are:
+
+- `POST /api/frontend/code-inference`: run direct single-code inference with a trained CodeBERT or UniXcoder checkpoint
+- `POST /api/jobs/classical`: trigger `train.sh` or `test.sh`
+- `POST /api/jobs/classical-imbalance`: trigger `train_imbalance.sh` or `test_imbalance.sh`
+- `POST /api/jobs/llm`: trigger `finetune.sh` or `inference.sh`
+- `POST /api/jobs/llm-imbalance`: trigger `finetune_imbalance.sh` or `inference_imbalance.sh`
+- `POST /api/jobs/ablation`: trigger `finetune_ablation.sh` or `inference_ablation.sh`
+- `POST /api/jobs/to-graph`: trigger `to_graph.sh`
+- `GET /api/jobs`: list all submitted jobs
+- `GET /api/jobs/{job_id}`: query one job
+- `GET /api/jobs/{job_id}/log`: fetch the tail of the log file for frontend polling
+
+By default the backend enables CORS for all origins. You can restrict it with:
+
+```shell
+ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:3000 ./scripts/run_fastapi.sh
+```
 
 ### Quick start
 
@@ -84,14 +155,177 @@ To quickly get started, you can run the following examples:
 # For the experiments on Section 6.4.
 ./scripts/finetune_imbalance.sh   draper  llama3.1  0·2         0;
 ./scripts/inference_imbalance.sh  draper  llama3.1  0·2         0;
-./scripts/train_imbalance.sh      draper  CodeBERT  0·2         0;
+./scripts/train_imbalance.sh bigvul CodeBERT 0-512 1 0;
+./scripts/train_imbalance_test.sh bigvul_cwe20 CodeBERT 1 1 0;
 ./scripts/test_imbalance.sh       draper  CodeBERT  0·2         0;
 # For the experiments on Section 6.5.
 ./scripts/finetune_ablation.sh    reveal  llama3.1  8 16        0;
 ./scripts/inference_ablation.sh   reveal  llama3.1  8 16        0;
+# Llama 3.2 is also supported in LLM scripts.
+./scripts/finetune.sh             reveal  llama3.2  0-512 16    0;
+./scripts/inference.sh            reveal  llama3.2  0-512       0;
+./scripts/finetune_ablation.sh    bigvul  llama3.2  1 16        0;
+./scripts/inference_ablation.sh   bigvul  llama3.2  1 16        0;
 ```
 
 You can modify the command-line arguments in the above examples to perform other experiments mentioned in the paper.
+For the ablation scripts, the arguments are `<DATASET_NAME> <MODEL_NAME> <R> <ALPHA> [CUDA]`.
+
+### Rebucket alpaca data by token length
+
+If you already have split Alpaca-format JSON files and want to rebucket them by token length in place, you can use:
+
+```shell
+venv/bin/python data_process/rebucket_alpaca_by_length.py \
+  --dataset-dir data/cvefixes_cwe77 \
+  --dataset-name cvefixes_cwe77 \
+  --input-prefix cvefixes_cwe77_0-512
+```
+
+This script will:
+
+- rename the original `alpaca/` directory to `alpaca1/`
+- create a new empty `alpaca/` directory
+- read `*_train.json`, `*_validate.json`, and `*_test.json` from `alpaca1/`
+- compute token length from each sample's `input` field using `model/Llama-3.2-1B`
+- write rebucketed files back into the new `alpaca/` directory
+- save files with the naming rule `数据集名称_长度_train|validate|test.json`
+- append a `token_length` field to each output sample
+- delete `alpaca1/` after successful completion
+
+For the example above, the generated files are placed under:
+
+- `data/cvefixes_cwe77/alpaca/`
+
+The output naming rule is:
+
+- `<dataset_name>_0-512_train.json`
+- `<dataset_name>_512-1024_train.json`
+- `<dataset_name>_1024-*_train.json`
+- the same pattern is used for `validate` and `test`
+
+You can also customize the bucket boundaries or process only selected splits:
+
+```shell
+venv/bin/python data_process/rebucket_alpaca_by_length.py \
+  --dataset-dir data/cvefixes_cwe77 \
+  --dataset-name cvefixes_cwe77 \
+  --input-prefix cvefixes_cwe77_0-512 \
+  --bucket-boundaries 256 512 1024 \
+  --splits train validate
+```
+
+### Reviewer fine-tuning workflow
+
+If you want to fine-tune an LLM reviewer on top of the positive predictions made by a small model, you can use the following two-step workflow.
+
+1. Generate reviewer CSV files from an existing small-model checkpoint directory under `outputs/<RESULT_MODEL>_imbalance/<DATASET>_<LENGTH>_<POS_RATIO>/`:
+
+```shell
+./scripts/test_imbalance_test.sh bigvul_cwe20 CodeBERT 1 1 0
+```
+
+This script reuses the existing checkpoint in `outputs/CodeBERT_imbalance/bigvul_cwe20_1_1/` and generates:
+
+- `reviewer_train.csv`
+- `reviewer_val.csv`
+- `reviewer_test.csv`
+- `results.csv` (compatibility copy of `reviewer_test.csv`)
+
+2. Prepare reviewer JSON files and rebucket them by token length:
+
+```shell
+./data_process/rebucket_reviewer_data.sh bigvul_cwe20 CodeBERT 1 1 0
+```
+
+This script will:
+
+- read `outputs/CodeBERT_imbalance/bigvul_cwe20_1_1/reviewer_train.csv`
+- read `outputs/CodeBERT_imbalance/bigvul_cwe20_1_1/reviewer_val.csv`
+- read `outputs/CodeBERT_imbalance/bigvul_cwe20_1_1/reviewer_test.csv`
+- generate reviewer JSON files under `reviewer_finetune_data/`
+- rebucket reviewer JSON files by token length
+
+3. Start LoRA fine-tuning from an already prepared bucket:
+
+```shell
+./scripts/finetune_test.sh bigvul_cwe20 CodeBERT llama3.2 1 1 4 0
+```
+
+The arguments are:
+
+- `<DATASET_NAME> <RESULT_MODEL_NAME> <LLM_MODEL_NAME> <LENGTH> <POS_RATIO> <BATCH_SIZE> [LENGTH_BUCKET] [CUDA]`
+
+For the example above, the script will:
+
+- read the already prepared rebucketed reviewer JSON files
+- launch `LLM/finetuning_test.py` using the rebucketed train/val JSON files
+
+The generated JSON files follow the naming rule:
+
+- `reviewer_finetune_data/CodeBERT_imbalance/bigvul_cwe20_1_1/train.json`
+- `reviewer_finetune_data/CodeBERT_imbalance/bigvul_cwe20_1_1/val.json`
+- `reviewer_finetune_data/CodeBERT_imbalance/bigvul_cwe20_1_1/test.json`
+
+After rebucketing, the script uses files under:
+
+- `reviewer_finetune_data/CodeBERT_imbalance/bigvul_cwe20_1_1_length_rebucketed/`
+
+For example:
+
+- `train_0-512.json`
+- `val_0-512.json`
+- `test_0-512.json`
+
+Each reviewer JSON sample keeps the following fields:
+
+```json
+{
+  "instruction": "The small model predicts that the following code contains a vulnerability. Determine whether this prediction should be kept or rejected.",
+  "input": "Small model confidence: 0.78\n\nCode:\n...",
+  "prob": 0.78,
+  "output": "0",
+  "index": 103840
+}
+```
+
+Notes:
+
+- reviewer fine-tuning currently keeps only the samples with `Prediction = 1` from the small-model CSV
+- `output = "1"` means `keep`
+- `output = "0"` means `reject`
+- `prob` is stored in the JSON and is also injected into the prompt as a standalone line before the code
+- `finetuning_test.py` reads the prepared JSON files directly; it no longer needs to build training samples from CSV on the fly
+- the default length bucket is `0-512`
+- if you want to specify a bucket explicitly, for example `512-1024`, use:
+
+```shell
+./scripts/finetune_test.sh bigvul_cwe20 CodeBERT llama3.2 1 1 4 512-1024 0
+```
+
+### Reviewer fine-tuning with OOF small-model predictions
+
+If you want the reviewer training set to use stricter out-of-fold (OOF) predictions from the small model, see the standalone guide:
+
+- [`OOF_README.md`](OOF_README.md)
+
+Short version:
+
+1. Train the small model normally and export the original reviewer CSV files.
+2. Run OOF to generate a new `reviewer_train.csv`.
+3. Build reviewer JSON files with `OOF train + original val/test`.
+4. Fine-tune the LoRA reviewer and evaluate it on the unchanged reviewer test split.
+
+The detailed guide in [`OOF_README.md`](OOF_README.md) covers both imbalance and non-imbalance datasets.
+
+Most commonly used scripts:
+
+- [`scripts/train_imbalance_oof.sh`](scripts/train_imbalance_oof.sh)
+- [`data_process/rebucket_reviewer_data_oof_train.sh`](data_process/rebucket_reviewer_data_oof_train.sh)
+- [`scripts/finetune_test.sh`](scripts/finetune_test.sh)
+- [`scripts/inference_finetune_test.sh`](scripts/inference_finetune_test.sh)
+
+- if the 7th argument is a plain value like `0`, the script treats it as `CUDA`, and `LENGTH_BUCKET` falls back to `0-512`
 
 Specifically, the second parameter represents the dataset name, which corresponds to the folder name in the `data/` directory.
 You can customize a new dataset (assume it is named `xxx`) by following the template of our open-sourced dataset on the HuggingFace repository. Store it according to the following file structure:
@@ -111,7 +345,7 @@ data
 
 The third parameter specifies the model name, which has the presetting supported values:
 
-- For scripts prefixed with `finetune` and `inference`, the supported values are: `llama-2`, `codellama`, `llama-3`, and `llama-3.1` (all lowercase).
+- For scripts prefixed with `finetune` and `inference`, the supported values are: `llama2`, `codellama`, `llama3`, `llama3.1`, and `llama3.2` (all lowercase).
 - For scripts prefixed with `train` and `test`, the supported values are: `Devign`, `ReGVD`, `GraphCodeBERT`, `CodeBERT`, and `UniXcoder` (case-sensitive).
 
 Other parameters can refer to the usage within every script.

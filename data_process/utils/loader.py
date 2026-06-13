@@ -3,7 +3,7 @@ import os.path as osp
 import re
 import json
 
-from preprocess.d2a import ALL_PROJECTS
+# from preprocess.d2a import ALL_PROJECTS
 from utils import save_dataset_dict
 
 
@@ -91,6 +91,7 @@ def load_bigvul(json_path):
 def load_d2a(json_dir):
     idx = 0
     data = {}
+    ALL_PROJECTS = ['ffmpeg', 'httpd', 'libav', 'libtiff', 'nginx', 'openssl']
 
     for project in ALL_PROJECTS:
         project_dir = osp.join(json_dir, project)

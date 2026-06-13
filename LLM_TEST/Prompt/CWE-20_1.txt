@@ -1,0 +1,23 @@
+You are a security expert.
+
+Detect whether the following code has a CWE-20 (Improper Input Validation) vulnerability.
+
+[Target Code]
+<CODE>
+
+A similar historical case (previously misclassified by a model) is provided:
+
+- Pattern: <brief pattern>
+- Snippet:
+<SIMILAR CODE>
+
+IMPORTANT:
+Do NOT assume they have the same vulnerability.
+Only use it as a reference.
+
+Steps:
+1. Identify input source
+2. Check validation
+3. Identify dangerous usage
+4. Compare with the similar case
+5. Decide if validation is insufficient

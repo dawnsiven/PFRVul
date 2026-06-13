@@ -99,6 +99,13 @@ if __name__ == '__main__':
                       loss_function=loss_function, optimizer=optim, model_dir=model_dir,
                       dev_every=64, log_every=None, max_patience=100)
     if args.do_test:
+        model_path = os.path.join(model_dir, 'model.bin')
+        if os.path.exists(model_path):
+            model.load_state_dict(torch.load(model_path))
+            print(f"Loaded model from {model_path}")
+        else:
+            print("WARNING: model.bin not found, using random model!")
+
         acc, pr, rc, f1, fpr = evaluate_metrics(model, loss_function, dataset.initialize_test_batch(),
                                                 dataset.get_next_test_batch, args.csv_path)
         debug('%s\tTest Accuracy: %0.2f\tPrecision: %0.2f\tRecall: %0.2f\tF1: %0.2f\t FPR: %0.2f'
